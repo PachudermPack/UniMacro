@@ -1,7 +1,3 @@
-// UniMacro - main.cpp
-// Fixed: consistent K/D flags (keepOriginal/dropOriginal), apply to AutoClick and Bind.
-// Compile on Windows with MSVC or MinGW (link winmm.lib).
-
 #include <windows.h>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
@@ -14,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <atomic>
+#include <cmath>
 
 #ifndef LLKHF_INJECTED
 #define LLKHF_INJECTED 0x10
@@ -24,28 +21,29 @@
 
 struct Macro {
     enum ActionType { ACTION_AUTOCLICK = 0, ACTION_BIND = 1 } action = ACTION_AUTOCLICK;
-    // autoclick: true = HOLD, false = TOGGLE
     bool clickHold = true;
-
-    // old-style fields (kept for compatibility)
-    bool bindKeepOriginal = false; // K (legacy)
-    bool bindDropOriginal = false; // D (legacy)
-
-    // unified K/D flags used by logic
-    bool keepOriginal = false; // K
-    bool dropOriginal = false; // D
-
-    DWORD triggerCfg = 0;   // config code for trigger (from KeyMapping.cfg or literal)
-    DWORD targetCfg = 0;    // config code to send when triggered
-    DWORD intervalMs = 0;   // autoclick interval
-
-    std::atomic_bool active{false};         // autoclick currently active (HOLD or TOGGLE)
-    std::atomic_bool bindTargetDown{false}; // state for bind target (to send matching up)
+    bool bindKeepOriginal = false;
+    bool bindDropOriginal = false;
+    bool keepOriginal = false;
+    bool dropOriginal = false;
+    DWORD triggerCfg = 0;
+    DWORD targetCfg = 0;
+    float originalIntervalMs = 0.0f; // Original parsed interval for display and CPS
+    float effectiveIntervalMs = 0.0f; // Effective interval for timer
+    std::atomic_bool active{false};
+    std::atomic_bool bindTargetDown{false};
     MMRESULT timerId{0};
+    int clicksPerTick = 1; // Number of clicks per timer tick for sub-ms intervals
 };
 
 static std::vector<Macro*> macros;
-static std::unordered_map<std::string,int> keyMap; // name(lower)->code
+static std::unordered_map<std::string,int> keyMap;
+static std::atomic_bool isPaused{false};
+static bool key8Down = false; // VK_8 (top-row '8')
+static bool key9Down = false; // VK_9 (top-row '9')
+static bool key0Down = false; // VK_0 (top-row '0')
+static ULONGLONG lastPauseToggle = 0;
+static const DWORD DEBOUNCE_MS = 500;
 
 // -------- utilities --------
 static inline std::string trim(const std::string &s){
@@ -59,7 +57,6 @@ static inline std::string toLowerStr(std::string s){
     return s;
 }
 
-// find a file in current working directory or next to the exe
 static std::string findFileNearby(const std::string &name){
     std::ifstream f(name);
     if(f.good()){ f.close(); return name; }
@@ -85,7 +82,6 @@ static bool LoadKeyMap(const std::string &path){
     size_t lineno = 0;
     while(std::getline(in,line)){
         ++lineno;
-        // strip comments starting with # or ;
         size_t pos = line.find_first_of("#;");
         std::string s = (pos==std::string::npos) ? line : line.substr(0,pos);
         s = trim(s);
@@ -95,29 +91,26 @@ static bool LoadKeyMap(const std::string &path){
         std::string name = trim(s.substr(0,eq));
         std::string rhs  = trim(s.substr(eq+1));
         if(name.empty() || rhs.empty()) continue;
-        // take first token from rhs (in case there are trailing comments without '#')
         size_t sp = rhs.find_first_of(" \t");
         std::string valtok = (sp==std::string::npos) ? rhs : rhs.substr(0,sp);
         try{
-            int code = std::stoi(valtok,nullptr,0); // base 0 supports 0x..
+            int code = std::stoi(valtok,nullptr,0);
             keyMap[toLowerStr(name)] = code;
         }catch(...){
-            std::cerr << "KeyMap: cannot parse code on line " << lineno << ": " << line << "\n";
             continue;
         }
     }
     return true;
 }
 
-// -------- Resolve name -> numeric code (KeyMap first, then built-ins) --------
+// -------- Resolve name -> numeric code --------
 static int ResolveKeyName(const std::string &name){
     std::string n = toLowerStr(trim(name));
     if(n.empty()) return -1;
     auto it = keyMap.find(n);
     if(it != keyMap.end()) return it->second;
 
-    // built-in shortcuts (fallbacks)
-    if(n=="lmb" || n=="mouse1") return 253; // custom left-click code handled separately
+    if(n=="lmb" || n=="mouse1") return 253;
     if(n=="rmb" || n=="mouse2") return 252;
     if(n=="mmb" || n=="mouse3" || n=="mouse_middle") return 4;
     if(n=="mouse4") return 5;
@@ -135,7 +128,6 @@ static int ResolveKeyName(const std::string &name){
     if(n=="backspace") return VK_BACK;
     if(n=="capslock") return VK_CAPITAL;
 
-    // F1..F24 shorthand
     if(n.size()>=2 && n[0]=='f'){
         try{
             int fn = std::stoi(n.substr(1));
@@ -153,7 +145,7 @@ static int ResolveKeyName(const std::string &name){
     return -1;
 }
 
-// ---- Map config code to VK code used for detection (mouse custom codes -> VKs) ----
+// ---- Map config code to VK code ----
 static int MapConfigCodeToDetectVK(int cfg){
     switch(cfg){
         case 253: return VK_LBUTTON;
@@ -161,14 +153,13 @@ static int MapConfigCodeToDetectVK(int cfg){
         case 4:   return VK_MBUTTON;
         case 5:   return VK_XBUTTON1;
         case 6:   return VK_XBUTTON2;
-        // wheel codes cannot be "held" reliably -> can't detect by VK code
         case 254: return -1;
         case 255: return -1;
-        default: return cfg; // assume it's a VK code already
+        default: return cfg;
     }
 }
 
-// ---- Sending helpers (down/up/tap) ----
+// ---- Sending helpers ----
 static void SendDownByConfigCode(int cfg){
     if(cfg == 253){ INPUT in = {}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1,&in,sizeof(INPUT)); return; }
     if(cfg == 252){ INPUT in = {}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1,&in,sizeof(INPUT)); return; }
@@ -184,7 +175,7 @@ static void SendUpByConfigCode(int cfg){
     if(cfg == 252){ INPUT in = {}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_RIGHTUP; SendInput(1,&in,sizeof(INPUT)); return; }
     if(cfg == 4){ INPUT in = {}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_MIDDLEUP; SendInput(1,&in,sizeof(INPUT)); return; }
     if(cfg == 5 || cfg == 6){ WORD which = (cfg==5)?XBUTTON1:XBUTTON2; INPUT in = {}; in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_XUP; in.mi.mouseData = which; SendInput(1,&in,sizeof(INPUT)); return; }
-    if(cfg == 254 || cfg == 255){ /* wheel has no up/down */ return; }
+    if(cfg == 254 || cfg == 255){ return; }
 
     INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = (WORD)cfg; in.ki.dwFlags = KEYEVENTF_KEYUP; SendInput(1,&in,sizeof(INPUT));
 }
@@ -200,73 +191,94 @@ static void SendClickByConfigCode(int cfg){
 }
 
 // ---- Parse a macro line ----
-// Allowed forms:
-//  [AutoClick] [HOLD|TOGGLE] [K|D] "trigger" "target" [interval_ms]
-//  [Bind] [K|D] "trigger" "target"
 static bool ParseMacroLine(const std::string &line,
                            std::string &actionOut, std::string &modeOut,
                            bool &keepOut, bool &dropOut,
                            std::string &triggerOut, std::string &targetOut,
-                           DWORD &intervalOut)
+                           float &intervalOut)
 {
     size_t i=0, n=line.size();
     auto skip=[&](){ while(i<n && std::isspace((unsigned char)line[i])) ++i; };
     skip();
-    // [Action]
-    if(!(i<n && line[i]=='[')) return false;
-    ++i; size_t start=i;
+    if(!(i<n && line[i]=='[')){
+        return false;
+    }
+    ++i; size_t actionStart=i;
     while(i<n && line[i]!=']') ++i;
-    if(i>=n) return false;
-    actionOut = trim(line.substr(start, i-start));
+    if(i>=n){
+        return false;
+    }
+    actionOut = trim(line.substr(actionStart, i-actionStart));
     ++i; skip();
-    // [Mode] (optional)
+
+    // Mode is only valid for AutoClick (HOLD or TOGGLE)
     modeOut = "";
-    if(i<n && line[i]=='['){
-        ++i; start=i;
+    bool isBind = (toLowerStr(actionOut) == "bind");
+    if(!isBind && i<n && line[i]=='['){
+        ++i; size_t modeStart=i;
         while(i<n && line[i]!=']') ++i;
-        if(i>=n) return false;
-        modeOut = trim(line.substr(start, i-start));
+        if(i>=n){
+            return false;
+        }
+        modeOut = trim(line.substr(modeStart, i-modeStart));
         ++i; skip();
     }
-    // optional [K] or [D]
+
+    // Parse flags ([K] or [D])
     keepOut = false; dropOut = false;
     if(i<n && line[i]=='['){
-        size_t prev=i;
-        ++i; start=i;
+        ++i; size_t flagStart=i;
         while(i<n && line[i]!=']') ++i;
-        if(i>=n) return false;
-        std::string tag = trim(line.substr(start, i-start));
-        if(toLowerStr(tag)=="k" || toLowerStr(tag)=="keep") keepOut = true;
-        if(toLowerStr(tag)=="d" || toLowerStr(tag)=="drop") dropOut = true;
+        if(i>=n){
+            return false;
+        }
+        std::string tag = trim(line.substr(flagStart, i-flagStart));
+        std::string tagLower = toLowerStr(tag);
+        if(tagLower == "k" || tagLower == "keep"){
+            keepOut = true;
+        } else if(tagLower == "d" || tagLower == "drop"){
+            dropOut = true;
+        }
         ++i; skip();
     }
-    // "trigger"
-    if(!(i<n && line[i]=='\"')) return false;
-    ++i; start=i;
+
+    if(!(i<n && line[i]=='\"')){
+        return false;
+    }
+    ++i; size_t triggerStart=i;
     while(i<n && line[i]!='\"') ++i;
-    if(i>=n) return false;
-    triggerOut = trim(line.substr(start, i-start));
+    if(i>=n){
+        return false;
+    }
+    triggerOut = trim(line.substr(triggerStart, i-triggerStart));
     ++i; skip();
-    // "target"
-    if(!(i<n && line[i]=='\"')) return false;
-    ++i; start=i;
+    if(!(i<n && line[i]=='\"')){
+        return false;
+    }
+    ++i; size_t targetStart=i;
     while(i<n && line[i]!='\"') ++i;
-    if(i>=n) return false;
-    targetOut = trim(line.substr(start, i-start));
+    if(i>=n){
+        return false;
+    }
+    targetOut = trim(line.substr(targetStart, i-targetStart));
     ++i; skip();
-    // optional [interval]
-    intervalOut = 0;
+    intervalOut = 0.0f;
     if(i<n && line[i]=='['){
-        ++i; start=i;
+        ++i; size_t intervalStart=i;
         while(i<n && line[i]!=']') ++i;
-        if(i>=n) return false;
-        std::string istr = trim(line.substr(start,i-start));
-        ++i; skip();
+        if(i>=n){
+            return false;
+        }
+        std::string istr = trim(line.substr(intervalStart,i-intervalStart));
         try {
-            int v = std::stoi(istr,nullptr,0);
-            if(v<=0) return false;
-            intervalOut = static_cast<DWORD>(v);
-        } catch(...) { return false; }
+            float v = std::stof(istr);
+            if(v<=0){
+                return false;
+            }
+            intervalOut = v;
+        } catch(...) {
+            return false;
+        }
     }
     return true;
 }
@@ -274,36 +286,33 @@ static bool ParseMacroLine(const std::string &line,
 // ---- Load macros file ----
 static bool LoadMacrosFile(const std::string &path){
     std::ifstream in(path);
-    if(!in.is_open()) return false;
+    if(!in.is_open()){
+        return false;
+    }
     std::string line;
     size_t lineno=0;
     while(std::getline(in,line)){
         ++lineno;
         std::string s=line;
-        // strip comments starting with # or ;
         size_t cpos = s.find_first_of("#;");
         if(cpos!=std::string::npos) s = s.substr(0,cpos);
         s = trim(s);
         if(s.empty()) continue;
         std::string action, mode, trgName, tgtName;
         bool keep=false, drop=false;
-        DWORD interval = 0;
+        float interval = 0.0f;
         if(!ParseMacroLine(s, action, mode, keep, drop, trgName, tgtName, interval)){
-            std::cerr << "Skipping invalid macro line " << lineno << ": " << s << "\n";
             continue;
         }
-        // normalize names
         std::string trgNameN = toLowerStr(trim(trgName));
         std::string tgtNameN = toLowerStr(trim(tgtName));
 
         int trg = ResolveKeyName(trgNameN);
         int tgt = ResolveKeyName(tgtNameN);
         if(trg == -1){
-            std::cerr << "Unknown trigger name '" << trgName << "' on line " << lineno << "\n";
             continue;
         }
         if(tgt == -1){
-            std::cerr << "Unknown target name '" << tgtName << "' on line " << lineno << "\n";
             continue;
         }
         Macro *m = new Macro();
@@ -311,20 +320,24 @@ static bool LoadMacrosFile(const std::string &path){
         m->targetCfg  = static_cast<DWORD>(tgt);
         m->clickHold = true;
         if(toLowerStr(action)=="autoclick"){
-            // apply K/D flags also to autoclick
             m->keepOriginal = keep;
             m->dropOriginal = drop;
-            // keep legacy fields in sync
             m->bindKeepOriginal = keep;
             m->bindDropOriginal = drop;
             m->action = Macro::ACTION_AUTOCLICK;
             if(toLowerStr(mode)=="toggle") m->clickHold = false;
             if(interval==0){
-                std::cerr << "AutoClick requires [interval] on line " << lineno << "\n";
                 delete m;
                 continue;
             }
-            m->intervalMs = interval;
+            m->originalIntervalMs = interval;
+            if(interval < 1.0f){
+                m->clicksPerTick = static_cast<int>(std::ceil(1.0f / interval));
+                m->effectiveIntervalMs = 1.0f; // Minimum timer resolution
+            } else {
+                m->clicksPerTick = 1;
+                m->effectiveIntervalMs = interval;
+            }
             m->active.store(false);
         } else if(toLowerStr(action)=="bind"){
             m->action = Macro::ACTION_BIND;
@@ -332,39 +345,41 @@ static bool LoadMacrosFile(const std::string &path){
             m->dropOriginal = drop;
             m->bindKeepOriginal = keep;
             m->bindDropOriginal = drop;
-            m->intervalMs = 0;
+            m->originalIntervalMs = 0.0f;
+            m->effectiveIntervalMs = 0.0f;
+            m->clicksPerTick = 0;
             m->active.store(false);
             m->bindTargetDown.store(false);
         } else {
-            std::cerr << "Unknown action '"<<action<<"' on line "<<lineno<<"\n";
             delete m;
             continue;
         }
         macros.push_back(m);
     }
+    in.close();
     return true;
 }
 
-// ---- Timer callback: dwUser is pointer to Macro ----
+// ---- Timer callback ----
 void CALLBACK MacroTimerProc(UINT, UINT, DWORD_PTR dwUser, DWORD_PTR, DWORD_PTR){
     Macro *m = reinterpret_cast<Macro*>(dwUser);
     if(!m) return;
+    if(isPaused.load()) return;
     if(m->action != Macro::ACTION_AUTOCLICK) return;
     if(m->active.load()){
-        SendClickByConfigCode((int)m->targetCfg);
+        for(int i = 0; i < m->clicksPerTick; ++i){
+            SendClickByConfigCode((int)m->targetCfg);
+        }
     }
 }
 
-// ---- Low-level hooks: keyboard and mouse ----
+// ---- Low-level hooks ----
 static HHOOK gKeyboardHook = nullptr;
 static HHOOK gMouseHook = nullptr;
 
-// helper to decide whether to suppress original event based on macro flags
 static inline bool ShouldSuppressOriginal(const Macro* m){
-    // Respect explicit K/D flags for any macro
     if(m->keepOriginal) return false;
     if(m->dropOriginal) return true;
-    // default: suppress original trigger to avoid duplicate behavior
     return true;
 }
 
@@ -372,26 +387,50 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam){
     if(nCode < HC_ACTION) return CallNextHookEx(gKeyboardHook,nCode,wParam,lParam);
     auto info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
     if(!info) return CallNextHookEx(gKeyboardHook,nCode,wParam,lParam);
-    // ignore injected events (we generated them via SendInput)
     if((info->flags & LLKHF_INJECTED) != 0) return CallNextHookEx(gKeyboardHook,nCode,wParam,lParam);
 
     bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     int vk = (int)info->vkCode;
-    bool handled = false;
 
+    // Track pause keys (8, 9, 0 on top row)
+    if(vk == '8') key8Down = isDown;
+    if(vk == '9') key9Down = isDown;
+    if(vk == '0') key0Down = isDown;
+
+    // Check for pause toggle
+    if(key8Down && key9Down && key0Down){
+        ULONGLONG now = GetTickCount64();
+        if(now - lastPauseToggle > DEBOUNCE_MS){
+            bool wasPaused = isPaused.load();
+            isPaused.store(!wasPaused);
+            lastPauseToggle = now;
+            if(isPaused.load()){
+                for(auto m : macros){
+                    if(m->action == Macro::ACTION_AUTOCLICK){
+                        m->active.store(false);
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+
+    if(isPaused.load()) return CallNextHookEx(gKeyboardHook,nCode,wParam,lParam);
+
+    bool handled = false;
     for(auto m : macros){
         int detect = MapConfigCodeToDetectVK((int)m->triggerCfg);
         if(detect <= 0) continue;
         if(detect != vk) continue;
 
+        bool suppress = ShouldSuppressOriginal(m);
         if(m->action == Macro::ACTION_AUTOCLICK){
             if(m->clickHold){
                 m->active.store(isDown);
             } else {
-                // TOGGLE: toggle on key down only
                 if(isDown){ m->active.store(!m->active.load()); }
             }
-            handled = ShouldSuppressOriginal(m);
+            handled = handled || suppress;
         } else if(m->action == Macro::ACTION_BIND){
             if(isDown){
                 if(!m->bindTargetDown.load()){
@@ -404,13 +443,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam){
                     m->bindTargetDown.store(false);
                 }
             }
-            handled = ShouldSuppressOriginal(m);
+            handled = handled || suppress;
         }
-        // if macro matched, we break because a trigger should not match multiple macros identically
-        if(detect == vk) break;
     }
 
-    if(handled) return 1; // suppress original
+    if(handled) return 1;
     return CallNextHookEx(gKeyboardHook,nCode,wParam,lParam);
 }
 
@@ -418,8 +455,9 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam){
     if(nCode < HC_ACTION) return CallNextHookEx(gMouseHook,nCode,wParam,lParam);
     auto info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
     if(!info) return CallNextHookEx(gMouseHook,nCode,wParam,lParam);
-    // ignore injected events
     if((info->flags & LLMHF_INJECTED) != 0) return CallNextHookEx(gMouseHook,nCode,wParam,lParam);
+
+    if(isPaused.load()) return CallNextHookEx(gMouseHook,nCode,wParam,lParam);
 
     bool isDown = false;
     int evVK = -1;
@@ -450,16 +488,25 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam){
         if(detect <= 0) continue;
         if(detect != evVK) continue;
 
+        bool suppress = ShouldSuppressOriginal(m);
         if(m->action == Macro::ACTION_AUTOCLICK){
             if(m->clickHold){ m->active.store(isDown); }
             else { if(isDown) m->active.store(!m->active.load()); }
-            handled = ShouldSuppressOriginal(m);
+            handled = handled || suppress;
         } else if(m->action == Macro::ACTION_BIND){
-            if(isDown){ if(!m->bindTargetDown.load()){ SendDownByConfigCode((int)m->targetCfg); m->bindTargetDown.store(true); } }
-            else { if(m->bindTargetDown.load()){ SendUpByConfigCode((int)m->targetCfg); m->bindTargetDown.store(false); } }
-            handled = ShouldSuppressOriginal(m);
+            if(isDown){
+                if(!m->bindTargetDown.load()){
+                    SendDownByConfigCode((int)m->targetCfg);
+                    m->bindTargetDown.store(true);
+                }
+            } else {
+                if(m->bindTargetDown.load()){
+                    SendUpByConfigCode((int)m->targetCfg);
+                    m->bindTargetDown.store(false);
+                }
+            }
+            handled = handled || suppress;
         }
-        if(detect == evVK) break;
     }
 
     if(handled) return 1;
@@ -478,69 +525,55 @@ static void CleanupAll(){
 
 int main(int argc, char** argv){
     std::cout << "UniMacro engine starting...\n";
+    std::cout << "8+9+0 to pause/resume\n";
 
     std::string keymapName = "KeyMapping.cfg";
     std::string keymapPath = findFileNearby(keymapName);
     if(!keymapPath.empty()){
         if(LoadKeyMap(keymapPath)){
             std::cout << "Loaded KeyMapping from: " << keymapPath << "\n";
-        } else {
-            std::cout << "Failed to parse KeyMapping.cfg (will use built-in names)\n";
         }
-    } else {
-        std::cout << "KeyMapping.cfg not found; using built-in names.\n";
     }
 
     std::string iniName = "UniMacro.ini";
     if(argc >= 2) iniName = argv[1];
     std::string iniPath = findFileNearby(iniName);
     if(iniPath.empty()){
-        std::cerr << "Cannot find " << iniName << " next to exe or in working dir.\n";
         return 1;
     }
-    if(!LoadMacrosFile(iniPath)){
-        std::cerr << "No macros loaded from " << iniPath << "\n";
-    }
+    LoadMacrosFile(iniPath);
 
     std::cout << "Macros loaded: " << macros.size() << "\n";
     for (size_t i = 0; i < macros.size(); ++i) {
         auto m = macros[i];
+        std::string mode = m->action == Macro::ACTION_AUTOCLICK
+            ? (m->clickHold ? "HOLD" : "TOGGLE")
+            : (m->keepOriginal ? "K" : (m->dropOriginal ? "D" : "Default"));
         std::cout << "#" << (i + 1)
-              << ": action=" << (m->action == Macro::ACTION_AUTOCLICK ? "AutoClick" : "Bind")
-              << " triggerCfg=" << m->triggerCfg
-              << " targetCfg=" << m->targetCfg
-              << " intervalMs=" << m->intervalMs
-              << " mode="
-              << (m->action == Macro::ACTION_AUTOCLICK
-                      ? (m->clickHold ? "HOLD" : "TOGGLE")
-                      : (m->keepOriginal ? "K" : "D"))
-              << "\n";
+                  << ": action=" << (m->action == Macro::ACTION_AUTOCLICK ? "AutoClick" : "Bind")
+                  << " mode=" << mode
+                  << " triggerCfg=" << m->triggerCfg
+                  << " targetCfg=" << m->targetCfg
+                  << " intervalMs=" << m->originalIntervalMs;
+        if(m->action == Macro::ACTION_AUTOCLICK && m->originalIntervalMs > 0){
+            int cps = static_cast<int>(std::round(1000.0f / m->originalIntervalMs));
+            std::cout << "(-" << cps << "CPS)";
+        }
+        std::cout << "\n";
     }
 
-    // install hooks (low-level)
     gKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
-    if(!gKeyboardHook){
-        std::cerr << "Warning: failed to install keyboard hook\n";
-    }
     gMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
-    if(!gMouseHook){
-        std::cerr << "Warning: failed to install mouse hook\n";
-    }
 
-    //  start timers for autoclick macros
     timeBeginPeriod(1);
     for(auto m : macros){
         if(m->action == Macro::ACTION_AUTOCLICK){
-            if(m->intervalMs > 0){
-                m->timerId = timeSetEvent(m->intervalMs, 1, MacroTimerProc, (DWORD_PTR)m, TIME_PERIODIC | TIME_CALLBACK_FUNCTION);
-                if(!m->timerId) std::cerr << "Warning: timeSetEvent failed for interval " << m->intervalMs << "\n";
+            if(m->effectiveIntervalMs > 0){
+                m->timerId = timeSetEvent(static_cast<UINT>(m->effectiveIntervalMs), 1, MacroTimerProc, (DWORD_PTR)m, TIME_PERIODIC | TIME_CALLBACK_FUNCTION);
             }
         }
     }
 
-    std::cout << "Macro engine running. Close console window to stop.\n";
-
-    // message loop to keep hooks alive
     MSG msg;
     while(GetMessageW(&msg, nullptr, 0, 0)){
         TranslateMessage(&msg);
