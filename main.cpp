@@ -1,5 +1,7 @@
+#define UNICODE
 #include <windows.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #pragma comment(lib, "winmm.lib")
 
 #include <string>
@@ -19,6 +21,13 @@
 #define LLMHF_INJECTED 0x00000001
 #endif
 
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_REFRESH 1001
+#define ID_TRAY_EDIT    1002
+#define ID_TRAY_EXIT    1003
+#define ID_TRAY_INI_BASE 2000
+#define ID_TRAY_TOGGLE 1004
+
 struct Macro {
     enum ActionType { ACTION_AUTOCLICK = 0, ACTION_BIND = 1 } action = ACTION_AUTOCLICK;
     bool clickHold = true;
@@ -28,22 +37,32 @@ struct Macro {
     bool dropOriginal = false;
     DWORD triggerCfg = 0;
     DWORD targetCfg = 0;
-    float originalIntervalMs = 0.0f; // Original parsed interval for display and CPS
-    float effectiveIntervalMs = 0.0f; // Effective interval for timer
+    float originalIntervalMs = 0.0f;
+    float effectiveIntervalMs = 0.0f;
     std::atomic_bool active{false};
     std::atomic_bool bindTargetDown{false};
     MMRESULT timerId{0};
-    int clicksPerTick = 1; // Number of clicks per timer tick for sub-ms intervals
+    int clicksPerTick = 1;
 };
 
 static std::vector<Macro*> macros;
 static std::unordered_map<std::string,int> keyMap;
 static std::atomic_bool isPaused{false};
-static bool key8Down = false; // VK_8 (top-row '8')
-static bool key9Down = false; // VK_9 (top-row '9')
-static bool key0Down = false; // VK_0 (top-row '0')
+static bool key8Down = false;
+static bool key9Down = false;
+static bool key0Down = false;
 static ULONGLONG lastPauseToggle = 0;
 static const DWORD DEBOUNCE_MS = 500;
+static std::string currentIniPath;
+static std::vector<std::string> iniFiles;
+
+// Tray globals
+static NOTIFYICONDATA nid;
+static HMENU hMenu;
+static HWND hwndConsole;
+static HWND hwndTray;
+static bool consoleVisible = true;
+static WNDPROC originalConsoleProc = NULL;
 
 // -------- utilities --------
 static inline std::string trim(const std::string &s){
@@ -53,22 +72,92 @@ static inline std::string trim(const std::string &s){
     return s.substr(a,b-a);
 }
 static inline std::string toLowerStr(std::string s){
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
 
 static std::string findFileNearby(const std::string &name){
     std::ifstream f(name);
     if(f.good()){ f.close(); return name; }
-    char path[MAX_PATH];
-    if(GetModuleFileNameA(NULL,path,MAX_PATH) > 0){
-        std::string full(path);
-        size_t p = full.find_last_of("\\/");
-        if(p != std::string::npos){
-            std::string folder = full.substr(0,p+1);
-            std::string cand = folder + name;
-            std::ifstream f2(cand);
-            if(f2.good()){ f2.close(); return cand; }
+    TCHAR path[MAX_PATH];
+    if(GetModuleFileName(NULL,path,MAX_PATH) > 0){
+        std::wstring full(path);
+        size_t p = full.find_last_of(L"\\/");
+        if(p != std::wstring::npos){
+            std::wstring folder = full.substr(0,p+1);
+            // Check CFG folder first
+            std::wstring cfgCand = folder + L"CFG\\" + std::wstring(name.begin(), name.end());
+            std::ifstream f2;
+            f2.open(cfgCand);
+            if(f2.good()){ f2.close(); return std::string(cfgCand.begin(), cfgCand.end()); }
+            // Fallback to executable directory
+            std::wstring rootCand = folder + std::wstring(name.begin(), name.end());
+            f2.open(rootCand);
+            if(f2.good()){ f2.close(); return std::string(rootCand.begin(), rootCand.end()); }
+        }
+    }
+    return "";
+}
+
+// -------- Find all .ini files in the CFG directory --------
+static void FindIniFiles(std::vector<std::string> &outFiles){
+    outFiles.clear();
+    TCHAR path[MAX_PATH];
+    if(GetModuleFileName(NULL, path, MAX_PATH) > 0){
+        std::wstring full(path);
+        size_t p = full.find_last_of(L"\\/");
+        if(p != std::wstring::npos){
+            std::wstring folder = full.substr(0, p+1);
+            std::wstring searchPath = folder + L"CFG\\*.ini";
+            WIN32_FIND_DATAW findData;
+            HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+            if(hFind != INVALID_HANDLE_VALUE){
+                do {
+                    std::wstring fileName = findData.cFileName;
+                    outFiles.push_back(std::string(fileName.begin(), fileName.end()));
+                } while(FindNextFileW(hFind, &findData));
+                FindClose(hFind);
+            }
+        }
+    }
+}
+
+// -------- Save last used .ini file --------
+static void SaveLastConfig(const std::string &iniFile){
+    TCHAR path[MAX_PATH];
+    if(GetModuleFileName(NULL, path, MAX_PATH) > 0){
+        std::wstring full(path);
+        size_t p = full.find_last_of(L"\\/");
+        if(p != std::wstring::npos){
+            std::wstring folder = full.substr(0, p+1);
+            std::string lastConfigPath = std::string(folder.begin(), folder.end()) + "CFG\\last_config.txt";
+            std::ofstream out(lastConfigPath);
+            if(out.is_open()){
+                out << iniFile;
+                out.close();
+            }
+        }
+    }
+}
+
+// -------- Load last used .ini file --------
+static std::string LoadLastConfig(){
+    TCHAR path[MAX_PATH];
+    if(GetModuleFileName(NULL, path, MAX_PATH) > 0){
+        std::wstring full(path);
+        size_t p = full.find_last_of(L"\\/");
+        if(p != std::wstring::npos){
+            std::wstring folder = full.substr(0, p+1);
+            std::string lastConfigPath = std::string(folder.begin(), folder.end()) + "CFG\\last_config.txt";
+            std::ifstream in(lastConfigPath);
+            if(in.is_open()){
+                std::string lastIni;
+                std::getline(in, lastIni);
+                in.close();
+                // Verify the file still exists
+                std::string fullPath = findFileNearby(lastIni);
+                if(!fullPath.empty()) return lastIni;
+            }
         }
     }
     return "";
@@ -211,7 +300,6 @@ static bool ParseMacroLine(const std::string &line,
     actionOut = trim(line.substr(actionStart, i-actionStart));
     ++i; skip();
 
-    // Mode is only valid for AutoClick (HOLD or TOGGLE)
     modeOut = "";
     bool isBind = (toLowerStr(actionOut) == "bind");
     if(!isBind && i<n && line[i]=='['){
@@ -224,7 +312,6 @@ static bool ParseMacroLine(const std::string &line,
         ++i; skip();
     }
 
-    // Parse flags ([K] or [D])
     keepOut = false; dropOut = false;
     if(i<n && line[i]=='['){
         ++i; size_t flagStart=i;
@@ -283,6 +370,9 @@ static bool ParseMacroLine(const std::string &line,
     return true;
 }
 
+// ---- Function prototype for MacroTimerProc ----
+void CALLBACK MacroTimerProc(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
+
 // ---- Load macros file ----
 static bool LoadMacrosFile(const std::string &path){
     std::ifstream in(path);
@@ -291,6 +381,7 @@ static bool LoadMacrosFile(const std::string &path){
     }
     std::string line;
     size_t lineno=0;
+    std::vector<Macro*> newMacros;
     while(std::getline(in,line)){
         ++lineno;
         std::string s=line;
@@ -309,10 +400,7 @@ static bool LoadMacrosFile(const std::string &path){
 
         int trg = ResolveKeyName(trgNameN);
         int tgt = ResolveKeyName(tgtNameN);
-        if(trg == -1){
-            continue;
-        }
-        if(tgt == -1){
+        if(trg == -1 || tgt == -1){
             continue;
         }
         Macro *m = new Macro();
@@ -333,7 +421,7 @@ static bool LoadMacrosFile(const std::string &path){
             m->originalIntervalMs = interval;
             if(interval < 1.0f){
                 m->clicksPerTick = static_cast<int>(std::ceil(1.0f / interval));
-                m->effectiveIntervalMs = 1.0f; // Minimum timer resolution
+                m->effectiveIntervalMs = 1.0f;
             } else {
                 m->clicksPerTick = 1;
                 m->effectiveIntervalMs = interval;
@@ -354,9 +442,25 @@ static bool LoadMacrosFile(const std::string &path){
             delete m;
             continue;
         }
-        macros.push_back(m);
+        newMacros.push_back(m);
     }
     in.close();
+    
+    // Cleanup old macros
+    for(auto m : macros){
+        if(m->timerId) timeKillEvent(m->timerId);
+        delete m;
+    }
+    macros.clear();
+    
+    // Assign new macros and set up timers
+    macros = newMacros;
+    for(auto m : macros){
+        if(m->action == Macro::ACTION_AUTOCLICK && m->effectiveIntervalMs > 0){
+            m->timerId = timeSetEvent(static_cast<UINT>(m->effectiveIntervalMs), 1, MacroTimerProc, (DWORD_PTR)m, TIME_PERIODIC | TIME_CALLBACK_FUNCTION);
+        }
+    }
+    
     return true;
 }
 
@@ -392,12 +496,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam){
     bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     int vk = (int)info->vkCode;
 
-    // Track pause keys (8, 9, 0 on top row)
     if(vk == '8') key8Down = isDown;
     if(vk == '9') key9Down = isDown;
     if(vk == '0') key0Down = isDown;
 
-    // Check for pause toggle
     if(key8Down && key9Down && key0Down){
         ULONGLONG now = GetTickCount64();
         if(now - lastPauseToggle > DEBOUNCE_MS){
@@ -410,6 +512,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam){
                         m->active.store(false);
                     }
                 }
+                std::wcout << L"Macros paused\n";
+            } else {
+                std::wcout << L"Macros resumed\n";
             }
             return 1;
         }
@@ -513,6 +618,182 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam){
     return CallNextHookEx(gMouseHook,nCode,wParam,lParam);
 }
 
+// ---- Tray functions ----
+static void ShowConsole(bool show) {
+    if (show) {
+        ShowWindow(hwndConsole, SW_RESTORE);
+        SetForegroundWindow(hwndConsole);
+    } else {
+        ShowWindow(hwndConsole, SW_MINIMIZE);
+    }
+    consoleVisible = show;
+}
+
+// ---- Build tray menu with dynamic .ini files submenu ----
+static void BuildTrayMenu() {
+    if(hMenu) DestroyMenu(hMenu);
+    hMenu = CreatePopupMenu();
+    
+    // Add "Switch Config" submenu
+    HMENU hSubMenu = CreatePopupMenu();
+    FindIniFiles(iniFiles);
+    for(size_t i = 0; i < iniFiles.size(); ++i) {
+        std::wstring wFileName(iniFiles[i].begin(), iniFiles[i].end());
+        AppendMenuW(hSubMenu, MF_STRING, ID_TRAY_INI_BASE + i, wFileName.c_str());
+    }
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSubMenu, L"\u0412\u044b\u0431\u0440\u0430\u0442\u044c \u043a\u043e\u043d\u0444\u0438\u0433");
+
+    // Add Start/Stop toggle
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE, isPaused.load() ? L"\u0421\u0442\u0430\u0440\u0442" : L"\u0421\u0442\u043e\u043f");
+
+    // Add other menu items
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_REFRESH, L"\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c \u043c\u0430\u043a\u0440\u043e\u0441");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EDIT, L"\u0418\u0437\u043c\u0435\u043d\u0438\u0442\u044c \u043c\u0430\u043a\u0440\u043e\u0441");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"\u0412\u044b\u0445\u043e\u0434");
+}
+
+LRESULT CALLBACK ConsoleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+                consoleVisible = false;
+                return 0;
+            }
+            break;
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED) {
+                consoleVisible = false;
+            } else if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) {
+                consoleVisible = true;
+            }
+            break;
+        case WM_CLOSE:
+            ShowConsole(false);
+            return 0;
+    }
+    return CallWindowProc(originalConsoleProc, hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_TRAYICON:
+        if (lParam == WM_LBUTTONUP) {
+            ShowConsole(!consoleVisible);
+        } else if (lParam == WM_RBUTTONUP) {
+            BuildTrayMenu();
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+        }
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_TRAY_TOGGLE:
+            {
+                bool wasPaused = isPaused.load();
+                isPaused.store(!wasPaused);
+                if(isPaused.load()) {
+                    for(auto m : macros){
+                        if(m->action == Macro::ACTION_AUTOCLICK){
+                            m->active.store(false);
+                        }
+                    }
+                    std::wcout << L"Macros paused\n";
+                } else {
+                    std::wcout << L"Macros resumed\n";
+                }
+            }
+            break;
+        case ID_TRAY_REFRESH:
+            if(!currentIniPath.empty()) {
+                system("cls"); // Clear console
+                if(LoadMacrosFile(currentIniPath)) {
+                    SaveLastConfig(currentIniPath.substr(currentIniPath.find_last_of("\\/") + 1));
+                    std::wcout << L"Macros reloaded: " << macros.size() << L"\n";
+                    for (size_t i = 0; i < macros.size(); ++i) {
+                        auto m = macros[i];
+                        std::string mode = m->action == Macro::ACTION_AUTOCLICK
+                            ? (m->clickHold ? "HOLD" : "TOGGLE")
+                            : (m->keepOriginal ? "K" : (m->dropOriginal ? "D" : "Default"));
+                        std::wcout << L"#" << (i + 1)
+                                  << L": action=" << (m->action == Macro::ACTION_AUTOCLICK ? L"AutoClick" : L"Bind")
+                                  << L" mode=" << std::wstring(mode.begin(), mode.end())
+                                  << L" triggerCfg=" << m->triggerCfg
+                                  << L" targetCfg=" << m->targetCfg
+                                  << L" intervalMs=" << m->originalIntervalMs;
+                        if(m->action == Macro::ACTION_AUTOCLICK && m->originalIntervalMs > 0){
+                            int cps = static_cast<int>(std::round(1000.0f / m->originalIntervalMs));
+                            std::wcout << L"(-" << cps << L"CPS)";
+                        }
+                        std::wcout << L"\n";
+                    }
+                } else {
+                    std::wcout << L"Failed to reload macros from " << std::wstring(currentIniPath.begin(), currentIniPath.end()) << L"\n";
+                }
+            }
+            break;
+        case ID_TRAY_EDIT:
+            if(!currentIniPath.empty()) {
+                ShellExecuteA(NULL, "open", currentIniPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            }
+            break;
+        case ID_TRAY_EXIT:
+            PostQuitMessage(0);
+            break;
+        default:
+            // Handle .ini file selection
+            if(LOWORD(wParam) >= ID_TRAY_INI_BASE && LOWORD(wParam) < ID_TRAY_INI_BASE + iniFiles.size()) {
+                size_t index = LOWORD(wParam) - ID_TRAY_INI_BASE;
+                if(index < iniFiles.size()) {
+                    TCHAR path[MAX_PATH];
+                    if(GetModuleFileName(NULL, path, MAX_PATH) > 0) {
+                        std::wstring full(path);
+                        size_t p = full.find_last_of(L"\\/");
+                        if(p != std::wstring::npos) {
+                            std::wstring folder = full.substr(0, p+1);
+                            currentIniPath = std::string(folder.begin(), folder.end()) + "CFG\\" + iniFiles[index];
+                            system("cls"); // Clear console
+                            if(LoadMacrosFile(currentIniPath)) {
+                                SaveLastConfig(iniFiles[index]);
+                                std::wcout << L"Switched to config: " << std::wstring(iniFiles[index].begin(), iniFiles[index].end()) << L"\n";
+                                std::wcout << L"Macros loaded: " << macros.size() << L"\n";
+                                for (size_t i = 0; i < macros.size(); ++i) {
+                                    auto m = macros[i];
+                                    std::string mode = m->action == Macro::ACTION_AUTOCLICK
+                                        ? (m->clickHold ? "HOLD" : "TOGGLE")
+                                        : (m->keepOriginal ? "K" : (m->dropOriginal ? "D" : "Default"));
+                                    std::wcout << L"#" << (i + 1)
+                                              << L": action=" << (m->action == Macro::ACTION_AUTOCLICK ? L"AutoClick" : L"Bind")
+                                              << L" mode=" << std::wstring(mode.begin(), mode.end())
+                                              << L" triggerCfg=" << m->triggerCfg
+                                              << L" targetCfg=" << m->targetCfg
+                                              << L" intervalMs=" << m->originalIntervalMs;
+                                    if(m->action == Macro::ACTION_AUTOCLICK && m->originalIntervalMs > 0){
+                                        int cps = static_cast<int>(std::round(1000.0f / m->originalIntervalMs));
+                                        std::wcout << L"(-" << cps << L"CPS)";
+                                    }
+                                    std::wcout << L"\n";
+                                }
+                            } else {
+                                std::wcout << L"Failed to load config: " << std::wstring(iniFiles[index].begin(), iniFiles[index].end()) << L"\n";
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
 // ---- Cleanup helper ----
 static void CleanupAll(){
     for(auto m : macros){ if(m->timerId) timeKillEvent(m->timerId); }
@@ -521,46 +802,120 @@ static void CleanupAll(){
     timeEndPeriod(1);
     for(auto m : macros) delete m;
     macros.clear();
+    Shell_NotifyIcon(NIM_DELETE, &nid);
+    DestroyMenu(hMenu);
+    if (hwndTray) DestroyWindow(hwndTray);
+    if (originalConsoleProc) SetWindowLongPtr(hwndConsole, GWLP_WNDPROC, (LONG_PTR)originalConsoleProc);
 }
 
 int main(int argc, char** argv){
-    std::cout << "UniMacro engine starting...\n";
-    std::cout << "8+9+0 to pause/resume\n";
+    AllocConsole();
+    hwndConsole = GetConsoleWindow();
+    std::wcout << L"UniMacro engine starting...\n";
+    std::wcout << L"8+9+0 to pause/resume\n";
 
     std::string keymapName = "KeyMapping.cfg";
     std::string keymapPath = findFileNearby(keymapName);
     if(!keymapPath.empty()){
         if(LoadKeyMap(keymapPath)){
-            std::cout << "Loaded KeyMapping from: " << keymapPath << "\n";
+            std::wcout << L"Loaded KeyMapping from: " << std::wstring(keymapPath.begin(), keymapPath.end()) << L"\n";
         }
     }
 
-    std::string iniName = "UniMacro.ini";
-    if(argc >= 2) iniName = argv[1];
-    std::string iniPath = findFileNearby(iniName);
-    if(iniPath.empty()){
-        return 1;
+    // Try to load last used config
+    std::string iniName = LoadLastConfig();
+    if(iniName.empty() && argc >= 2) {
+        iniName = argv[1]; // Use command-line argument if provided
     }
-    LoadMacrosFile(iniPath);
 
-    std::cout << "Macros loaded: " << macros.size() << "\n";
-    for (size_t i = 0; i < macros.size(); ++i) {
-        auto m = macros[i];
-        std::string mode = m->action == Macro::ACTION_AUTOCLICK
-            ? (m->clickHold ? "HOLD" : "TOGGLE")
-            : (m->keepOriginal ? "K" : (m->dropOriginal ? "D" : "Default"));
-        std::cout << "#" << (i + 1)
-                  << ": action=" << (m->action == Macro::ACTION_AUTOCLICK ? "AutoClick" : "Bind")
-                  << " mode=" << mode
-                  << " triggerCfg=" << m->triggerCfg
-                  << " targetCfg=" << m->targetCfg
-                  << " intervalMs=" << m->originalIntervalMs;
-        if(m->action == Macro::ACTION_AUTOCLICK && m->originalIntervalMs > 0){
-            int cps = static_cast<int>(std::round(1000.0f / m->originalIntervalMs));
-            std::cout << "(-" << cps << "CPS)";
+    // Find all .ini files
+    FindIniFiles(iniFiles);
+    if(!iniFiles.empty()) {
+        std::wcout << L"Available config files: " << iniFiles.size() << L"\n";
+        for(const auto& file : iniFiles) {
+            std::wcout << L" - " << std::wstring(file.begin(), file.end()) << L"\n";
         }
-        std::cout << "\n";
+    } else {
+        std::wcout << L"No .ini files found in the CFG directory.\n";
     }
+
+    // If no specific iniName provided or last config doesn't exist, use first available .ini
+    if(iniName.empty() && !iniFiles.empty()) {
+        iniName = iniFiles[0];
+    }
+
+    // Load the selected or first .ini file
+    if(!iniName.empty()) {
+        TCHAR path[MAX_PATH];
+        if(GetModuleFileName(NULL, path, MAX_PATH) > 0) {
+            std::wstring full(path);
+            size_t p = full.find_last_of(L"\\/");
+            if(p != std::wstring::npos) {
+                std::wstring folder = full.substr(0, p+1);
+                currentIniPath = std::string(folder.begin(), folder.end()) + "CFG\\" + iniName;
+                if(LoadMacrosFile(currentIniPath)) {
+                    SaveLastConfig(iniName);
+                    std::wcout << L"Macros loaded from " << std::wstring(currentIniPath.begin(), currentIniPath.end()) << L": " << macros.size() << L"\n";
+                    for (size_t i = 0; i < macros.size(); ++i) {
+                        auto m = macros[i];
+                        std::string mode = m->action == Macro::ACTION_AUTOCLICK
+                            ? (m->clickHold ? "HOLD" : "TOGGLE")
+                            : (m->keepOriginal ? "K" : (m->dropOriginal ? "D" : "Default"));
+                        std::wcout << L"#" << (i + 1)
+                                  << L": action=" << (m->action == Macro::ACTION_AUTOCLICK ? L"AutoClick" : L"Bind")
+                                  << L" mode=" << std::wstring(mode.begin(), mode.end())
+                                  << L" triggerCfg=" << m->triggerCfg
+                                  << L" targetCfg=" << m->targetCfg
+                                  << L" intervalMs=" << m->originalIntervalMs;
+                        if(m->action == Macro::ACTION_AUTOCLICK && m->originalIntervalMs > 0){
+                            int cps = static_cast<int>(std::round(1000.0f / m->originalIntervalMs));
+                            std::wcout << L"(-" << cps << L"CPS)";
+                        }
+                        std::wcout << L"\n";
+                    }
+                } else {
+                    std::wcout << L"Failed to load config: " << std::wstring(iniName.begin(), iniName.end()) << L"\n";
+                }
+            }
+        }
+    } else {
+        std::wcout << L"No initial .ini file loaded. Use tray menu to select a config.\n";
+    }
+
+    HINSTANCE hInstance = GetModuleHandle(NULL);
+    WNDCLASS wc = { 0 };
+    wc.lpfnWndProc = TrayWndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"TrayAppClass";
+    RegisterClass(&wc);
+    hwndTray = CreateWindow(L"TrayAppClass", L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+
+    HICON hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(1));
+    if (!hIcon)
+        hIcon = LoadIcon(NULL, IDI_APPLICATION);
+
+    SendMessage(hwndConsole, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+    SendMessage(hwndConsole, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+    SetClassLongPtr(hwndConsole, GCLP_HICON, (LONG_PTR)hIcon);
+    SetClassLongPtr(hwndConsole, GCLP_HICONSM, (LONG_PTR)hIcon);
+
+    nid = { 0 };
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwndTray;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = hIcon;
+    wcscpy_s(nid.szTip, sizeof(nid.szTip)/sizeof(wchar_t), L"UniMacro Console");
+    Shell_NotifyIcon(NIM_ADD, &nid);
+
+    // Initial menu creation
+    BuildTrayMenu();
+
+    ShowConsole(true);
+
+    originalConsoleProc = (WNDPROC)GetWindowLongPtr(hwndConsole, GWLP_WNDPROC);
+    SetWindowLongPtr(hwndConsole, GWLP_WNDPROC, (LONG_PTR)ConsoleWndProc);
 
     gKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
     gMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
